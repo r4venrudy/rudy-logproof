@@ -1,0 +1,65 @@
+name: Build and verify
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            mode: standard
+          - os: windows-2022
+            mode: standard
+          - os: macos-15
+            mode: standard
+          - os: ubuntu-24.04
+            mode: race
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'off'
+      GOSUMDB: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - run: go vet ./...
+      - if: matrix.mode == 'standard'
+        run: go test ./...
+      - if: matrix.mode == 'race'
+        run: go test -race ./...
+      - name: Bounded proof and schema fuzz smoke
+        if: runner.os == 'Linux' && matrix.mode == 'standard'
+        run: go test ./merkle -run '^$' -fuzz '^FuzzVerify$' -fuzztime=15s -parallel=2
+      - name: JSON decoder fuzz smoke
+        if: runner.os == 'Linux' && matrix.mode == 'standard'
+        run: go test ./audit -run '^$' -fuzz '^FuzzDecode$' -fuzztime=15s -parallel=2
+      - name: Build native command and run independent oracle
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          bin=bin/logproof
+          if [[ "$RUNNER_OS" == "Windows" ]]; then bin=bin/logproof.exe; fi
+          go build -trimpath -o "$bin" ./cmd/logproof
+          python tests/integration.py "$bin" .

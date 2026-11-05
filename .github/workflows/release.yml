@@ -1,0 +1,80 @@
+name: Release verified packages
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+  package:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: windows-2022
+            target: windows-x64
+          - os: macos-15
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '0'
+      GOTOOLCHAIN: local
+      GOPROXY: 'off'
+      GOSUMDB: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.13'
+      - name: Native installed layout, independent tests and packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage/bin
+          bin=stage/bin/logproof
+          if [[ "$RUNNER_OS" == "Windows" ]]; then bin=stage/bin/logproof.exe; fi
+          go build -trimpath -o "$bin" ./cmd/logproof
+          python tools/package.py stage '${{ matrix.target }}' --version "${GITHUB_REF_NAME#v}"
+          python tests/integration.py "$bin" stage
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/logproof-*
+          if-no-files-found: error
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+      - name: Hash and publish tested preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd release-assets && sha256sum logproof-* > SHA256SUMS.txt)
+          python .github/scripts/release_checksums.py release-assets
+          python .github/scripts/release_guard.py release-assets
+          gh release create "$GITHUB_REF_NAME" release-assets/logproof-* release-assets/SHA256SUMS.txt --title "Rudy LogProof $GITHUB_REF_NAME" --notes-file docs/RELEASE.md --prerelease
